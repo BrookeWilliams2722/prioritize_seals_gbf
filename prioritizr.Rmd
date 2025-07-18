@@ -1,0 +1,733 @@
+#Code to run the optimisation side of the analysis
+```{r "knitr config", cache = FALSE, include=FALSE}
+require("knitr")
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+#Import packages
+```{r}
+# remotes::install_github("prioritizr/prioritizr@fix-problem-dgcmatrix")
+# load packages
+library(prioritizr)
+library(remotes)
+library(lifecycle)
+library(usethis)
+library(devtools)
+library(prioritizrdata)
+library(sf)
+library(raster)
+library(terra)
+library(gurobi)
+library(Matrix)
+library(parallel)
+library(data.table)
+rm(list=ls())
+
+# Get the number of CPU cores
+num_cores <- detectCores()
+cat("Number of CPU cores:", num_cores, "\n")
+options(scipen = 999)
+getwd()
+```
+#Set up folders
+```{r}
+v <- "v5"
+# Create output folders 
+outfolder <- paste0("./outputs_", v)
+outfoldermaps <- paste0("./outputs_", v, "/maps_", v)
+outfoldervals <- paste0("./outputs_", v, "/vals_", v)
+outfolderrasts <- paste0("./outputs_", v, "/rasters_", v)
+outfolderresults <- paste0("./outputs_", v, "/results_", v)
+
+# Create folders:
+if (!dir.exists(outfoldermaps)){
+  dir.create(outfoldermaps, recursive = TRUE)
+} else {
+  print("Dir already exists!")
+}
+if (!dir.exists(outfoldervals)){
+  dir.create(outfoldervals, recursive = TRUE)
+} else {
+  print("Dir already exists!")
+}
+if (!dir.exists(outfolderrasts)){
+  dir.create(outfolderrasts, recursive = TRUE)
+} else {
+  print("Dir already exists!")
+}
+if (!dir.exists(outfolderresults)){
+  dir.create(outfolderresults, recursive = TRUE)
+} else {
+  print("Dir already exists!")
+}
+
+```
+#Planning units
+```{r}
+# Planning units ID layer
+sr_ras = raster("inputs/CBD-corrected_countries-code.tif")
+base_ras = sr_ras - sr_ras
+terrestrial_index = which(!is.na(base_ras[]))
+base_ras[terrestrial_index] = 1
+plot(base_ras)
+pu_val <- values(base_ras)
+pu_val_index <- 1:ncell(base_ras)
+```
+#Feature dataframe
+```{r}
+# Load pre-processed matrices
+load(file = "./inputs/spp_list_matrix.RData")
+spp_df <- spp_list_mat
+spp_df <- as.data.frame(spp_df)
+# This function assigns weights to ensure that no species group dominates the optimisation
+assign_taxon_weights <- function(groups){
+	n <- length(unique(groups))
+	animals <- c("amphibians", "birds", "mammals", "reptiles")
+	plants <- unique(groups)[which(!unique(groups) %in% animals)]
+	# number of animals
+	na <- 4
+	# number of plants
+	np <- n - na
+  # in the current case there are no birds, so just spreading the weights among the animal taxon
+	wp <- 0 / np
+	wa <- 1 / na
+	w <- rep(0, length(groups))
+	
+	for (i in 1:length(animals)){
+		w[which(groups == animals[i])] <- wa / length(which(groups == animals[i]))
+	}
+
+	for (i in 1:length(plants)){
+		w[which(groups == plants[i])] <- wp / length(which(groups == plants[i]))
+	}
+	return(w)
+}
+spp_df$speciesweights <- assign_taxon_weights(groups=spp_df$taxon)
+
+# species.pu.list --> which species occurs in which planning unit
+load(file = "./inputs/species.pu.list.RData")
+
+# Features dataframe --> analysis id number and IUCN id number
+feat <- readRDS(file = "./inputs/feat.rds")
+
+# Get the proportion of natural land
+load(file = "./inputs/pu_df_matrix.RData")
+propnat <- combined_matrix[,6]
+
+# rij dataframe
+# Create an empty sparse matrix
+rowss <- nrow(feat)
+colss <- length(pu_val)
+iidx <- lapply(1:length(species.pu.list), function(i) rep(i, length(species.pu.list[[i]])))
+spp_w <- lapply(1:length(species.pu.list), function(i) rep(spp_df[i,6], length(species.pu.list[[i]])))
+spp_w <- unlist(spp_w)
+iidx <- unlist(iidx)
+jidx <- unlist(species.pu.list)
+
+# Need to make the species values in the matrix proportional to the natural area
+# Convert combined_matrix to a data.table
+dt <- as.data.table(combined_matrix)
+setkey(dt, puid)  # Set key for fast lookups
+# Replace puid values in species.pu.list with corresponding propnat values
+updated_species_pu_list <- lapply(seq_along(species.pu.list), function(i) {
+  # Print the current progress
+  cat("Processing list element:", i, "\n")
+  # Get the current puid list and ensure it is numeric
+  puids <- species.pu.list[[i]]
+  # Perform the lookup
+  result <- dt[J(as.numeric(puids)), on = "puid", propnat]
+  # Replace NA values with 0
+  result[is.na(result)] <- 0
+  return(result)
+})
+natprop <- unlist(updated_species_pu_list)
+vidx <- rep(1, length(jidx))
+
+# Final species value
+vidx <- vidx*spp_w*natprop
+
+# Standardize carbon values
+# Need to multiply cvals by the proportion of natural area
+cvals <- combined_matrix[,3]*combined_matrix[,6]
+# Standardise
+cvals[terrestrial_index] = (cvals[terrestrial_index] - min(cvals[terrestrial_index])) / (max(cvals[terrestrial_index]) - min(cvals[terrestrial_index]))
+
+# Check to see what the carbon values look like
+# base_ras[1:ncell(base_ras)] = cvals
+# plot(base_ras)
+
+```
+#Create weight matrix
+```{r, echo = FALSE}
+# Create weight matrix
+weightm <- matrix(0, nrow=11, ncol=2)
+nweights <- nrow(weightm)
+# Populate the weight matrix with decreasing and increasing values
+for (i in 1:nrow(weightm)) {
+  weightm[i, ] <- c(1 - (i - 1) / 10, (i - 1) / 10)
+}
+
+weightm[1, 1] <- 1
+weightm[1, 2] <- 0
+
+weightm[2, 1] <- 0.999
+weightm[2, 2] <- 0.001
+
+weightm[3, 1] <- 0.998
+weightm[3, 2] <- 0.002
+
+weightm[4, 1] <- 0.997
+weightm[4, 2] <- 0.003
+
+weightm[5, 1] <- 0.9975
+weightm[5, 2] <- 0.0025
+
+weightm[6, 1] <- 0.996
+weightm[6, 2] <- 0.004
+
+weightm[7, 1] <- 0.995
+weightm[7, 2] <- 0.005
+
+weightm[8, 1] <- 0.99
+weightm[8, 2] <- 0.01
+
+weightm[9, 1] <- 0.98
+weightm[9, 2] <- 0.02
+
+weightm[10, 1] <- 0.95
+weightm[10, 2] <- 0.05
+
+weightm[11, 1] <- 0
+weightm[11, 2] <- 1
+
+# Print the weight matrix
+print(weightm)
+```
+#Set target and locked in and out planning units
+```{r}
+# https://prioritizr.net/reference/add_locked_in_constraints.html
+# Set target to 30% of terrestrial area
+target <- length(terrestrial_index)*0.3
+locked_in <- combined_matrix[,4]
+locked_in <- locked_in[terrestrial_index]
+locked_in <- as.logical(locked_in)
+
+# Lock out the areas that are not available to protect
+locked_out <- combined_matrix[,5]
+locked_out <- locked_out[terrestrial_index]
+locked_out <- as.logical(locked_out)
+#Make sure that areas which are already protected stay protected
+locked_out[locked_in] <- FALSE
+sum(locked_out)
+
+base_ras[terrestrial_index] <- locked_out
+plot(base_ras)
+```
+
+# This is to run the analysis for different countries (30% for each country target) - maximum utility objective using prioritizr
+```{r}
+# Set up global parameters
+locked_in <- combined_matrix[,4]
+locked_in <- as.logical(locked_in)
+locked_out <- combined_matrix[,5]
+locked_out <- as.logical(locked_out)
+
+sr_ras = raster("inputs/CBD-corrected_countries-code.tif")
+base_ras = sr_ras - sr_ras
+
+unique_values <- unique(sr_ras)
+# Remove values that can't be run through the prioritisation for various reasons (eg. not enough planning units)
+
+unique_values <- unique_values[!unique_values %in% c(28, 31, 47, 79, 136, 165, 186, 197)]
+# unique_values <- unique_values[unique_values >= 29]
+
+# Record countries that already have >30% protected
+over_30_percent_protected_already <- c()
+
+# Code to run the optimization for each country
+for (m in unique_values){
+print(m)
+# Get indices for country of interest
+indices <- which(values(sr_ras) == m, arr.ind = TRUE)
+# Get locked in and out indices for country
+locked_in_country <- locked_in[indices]
+locked_out_country <- locked_out[indices]
+
+# Skip and record if country already has >30% protected
+if (sum(locked_in_country) > length(indices)*0.3) {
+  print("PA estate is greater than 30% of country")
+  over_30_percent_protected_already <- c(over_30_percent_protected_already, m)
+} else {
+  print("Less than 30% protected")
+  target <- round(length(indices)*0.3)
+  
+# Combine the results into a data frame
+df.results <- data.frame(matrix(nrow = nweights, ncol = 4))
+colnames(df.results) <- c("biow", "cw", "bioval", "cval")
+
+for (w in 1:nrow(weightm)) {
+# Create global structures that are manipulated by weights
+# Change feature values by the weight matrix - vidx*(weightm[w,1])
+sparse_mat <- sparseMatrix(i = iidx, j = jidx, x = (vidx*(weightm[w,1])), dims = c(rowss-1, colss))
+carbon_mat <- sparseMatrix(i = rep(1, length(cvals)), j = c(1:length(cvals)), x = cvals*weightm[w,2], dims = c(1, colss))
+
+# Joint carbon values to species matrix
+rij <- rbind(sparse_mat, carbon_mat)
+  
+pu_val <- rep(1, length(base_ras))
+pu_val_index <- 1:ncell(base_ras)
+
+# Restrict problem to just the country of interest
+pu_val_country <- pu_val[indices]
+rij_country <- rij[,indices]
+
+# If else statement
+if (sum(locked_out_country) > 0) {
+  
+  if (sum(locked_in_country) > 0) {
+    p1 <-
+    problem(pu_val_country, feat, rij_country) %>%
+    add_max_utility_objective(target) %>%
+    add_binary_decisions() %>%
+    add_default_solver(gap = 0.005, verbose = FALSE, threads = num_cores) %>%
+    add_locked_in_constraints(locked_in_country) %>%
+    add_locked_out_constraints(locked_out_country)
+  } else {
+    p1 <-
+    problem(pu_val_country, feat, rij_country) %>%
+    add_max_utility_objective(target) %>%
+    add_binary_decisions() %>%
+    add_default_solver(gap = 0.005, verbose = FALSE, threads = num_cores) %>%
+    add_locked_out_constraints(locked_out_country)
+    }
+
+} else {
+  
+  if (sum(locked_in_country) > 0) {
+    p1 <-
+    problem(pu_val_country, feat, rij_country) %>%
+    add_max_utility_objective(target) %>%
+    add_binary_decisions() %>%
+    add_default_solver(gap = 0.005, verbose = FALSE, threads = num_cores) %>%
+    add_locked_in_constraints(locked_in_country)
+  } else {
+    p1 <-
+    problem(pu_val_country, feat, rij_country) %>%
+    add_max_utility_objective(target) %>%
+    add_binary_decisions() %>%
+    add_default_solver(gap = 0.005, verbose = FALSE, threads = num_cores)
+}
+}
+
+s1 <- solve(p1, force = TRUE)
+save_index <- s1*indices
+
+# Assuming 'save_index' is your vector
+# Get a subset of values greater than 1 (ie. were selected)
+selected <- save_index[save_index > 1]
+saveRDS(selected, file = paste0(outfolderresults, "./", m, "_selected_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))
+saveRDS(save_index, file = paste0(outfolderresults, "./", m, "_save_index_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))
+}
+write.csv(df.results, file = paste0(outfoldervals, "./", m, "_results_p0.csv"), row.names = TRUE)
+}
+}
+```
+
+#Plotting benefits for all countries
+```{r}
+country_numbers <- unique(sr_ras)
+country_numbers <- country_numbers[!country_numbers %in% c(1, 4, 7, 28, 31, 47, 79, 136, 165, 186, 197)]
+
+#4 just has 4 planning units
+#No 15? 
+#No 24?
+#No 26?
+#No 30? 
+#No 36?
+#No 46
+#m <- 2
+
+for (m in unique(country_numbers)){
+  # Combine the results into a data frame
+  df.results <- data.frame(matrix(nrow = nweights, ncol = 4))
+  colnames(df.results) <- c("biow", "cw", "bioval", "cval")
+  print(m)
+
+  for (w in 1:nrow(weightm)) {
+    #Get indices for country of interest
+    indices <- which(values(sr_ras) == m, arr.ind = TRUE)
+
+    if (file.exists(paste0(outfolderresults, "/", m, "_save_index_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))) {
+      print("File exists!")
+      # Load the RDS file
+      save_index <- readRDS(paste0(outfolderresults, "/", m, "_save_index_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))
+    
+      # Initialize an empty vector for storing the proportions
+      # prop_all <- numeric(length(species.pu.list))
+      # sum_occ <- numeric(length(species.pu.list))
+      # 
+      # #Total sum of occurrences
+      # for (i in 1:length(species.pu.list)) {
+      #   # Count the number of elements in species.pu.list[[i]] that are also in newidx_set
+      #   #common_elements <- sum(species.pu.list[[i]] %in% save_index)
+      #   
+      #   # Need to pull out the values proportional to the area that is "natural" land
+      #   #spp_occ_vals_adjusted <- sparse_mat[i, save_index]
+      # 
+      #   sum_occ[i] <- sum(spp_occ_vals_adjusted)
+      #   # Check if N is a multiple of 1,000,000
+      #   if (i %% 10000 == 0) {
+      #     print(i/length(species.pu.list) * 100)
+      #   }
+      # }
+      # 
+      # Extract values > 0
+      values_greater_than_zero <- save_index[save_index > 0]
+      spp_occ_vals_adjusted <- sparse_mat[, save_index]
+
+      df.results[w, "biow"] <- weightm[w, 1]
+      df.results[w, "cw"] <- weightm[w, 2]
+      #df.results[w, "bioval"] <- mean(prop_all)
+      #df.results[w, "bioval"] <- sum(sum_occ)
+      df.results[w, "bioval"] <- sum(spp_occ_vals_adjusted)
+      subset_cvals <- cvals[indices]
+      df.results[w, "cval"] <- sum((subset_cvals)[which(save_index > 0)])
+      
+      #p = 0
+      # Plot tradeoff curve
+      #png(file = paste0(outfoldervals, "/countries/tradeoff_", "_", m, "_", p, ".png"), width = 1000, height = 1000)
+      png(file = paste0(outfoldervals, "/countries/tradeoff_", m, ".png"), width = 1000, height = 1000)
+      plot(df.results$bioval, df.results$cval, type = "b", pch = 16, lty = "solid",
+           ylab = "Carbon sequestered",
+           xlab = "Mean proportion of species range conserved")
+      dev.off()
+      
+      # write.csv(df.results, file = paste0(outfoldervals, "/countries/", m, "_benefits_", weightm[w,1], "_wc_",  
+      #weightm[w,2], "_p0.csv"), row.names = TRUE)
+      
+      write.csv(df.results, file = paste0(outfoldervals, "/countries/", m, "_benefits.csv"), row.names = TRUE)
+ 
+      
+  } else {
+    print(paste0(m," File does not exist!"))
+  }
+  }
+}
+
+```
+
+
+
+#Stitch together the selected planning units across all countries
+```{r}
+# Planning units ID layer
+#sr_ras = raster("R:/RHODESFUT-Q3276/GBF-downscaling-analysis/Data/IIS_Rio_Data/CBD-corrected_countries-code.tif")
+sr_ras = raster("C:/Data/Modelling_Beyer/z_GBF/Data/CBD-corrected_countries-code.tif")
+base_ras = sr_ras - sr_ras
+terrestrial_index = which(!is.na(base_ras[]))
+base_ras[terrestrial_index] = 0
+locked_in <- combined_matrix[,4]
+locked_in <- as.logical(locked_in)
+
+# Define the directory where your files are located
+#directory <- "C:/Data/Modelling_Beyer/z_GBF/SEALS_GBF_preprocessing/outputs_v3/results_v3"
+directory <- outfolderresults
+
+for (i in 1:nrow(weightm)) {
+selected <- c()
+files_matching_pattern <- list.files(directory, pattern = paste0("save_index_ws_", weightm[i, 1], "_wc_", weightm[i, 2], "_p0.rds"))
+# List files containing the specified pattern in the current directory
+for (y in 1:length(files_matching_pattern)){
+# Load the object from the RDS file
+loaded_object <- readRDS(paste0("C:/Data/Modelling_Beyer/z_GBF/SEALS_GBF_preprocessing/outputs_v4/results_v4/", files_matching_pattern[y]))
+selected <- c(selected, loaded_object)
+}
+# Get a list of all values that are greater than 0
+values_greater_than_0 <- selected[selected > 0]
+base_ras[values_greater_than_0] <- 1
+base_ras[locked_in] <- 1
+
+# Write the raster to a file
+writeRaster(base_ras, filename = paste0("C:/Data/Modelling_Beyer/z_GBF/SEALS_GBF_preprocessing/", outfolderrasts, "/results_ws_", weightm[i, 1], "_wc_", weightm[i, 2], "_p0.tiff"), format = "GTiff", overwrite = TRUE)
+
+saveRDS(selected, file = paste0(outfolderresults, "./save_index_global_ws_", weightm[i,1], "_wc_", weightm[i,2], "_p0.rds"))
+}
+
+```
+
+#Plotting benefits for global priorities
+```{r}
+# Combine the results into a data frame
+df.results <- data.frame(matrix(nrow = nweights, ncol = 4))
+colnames(df.results) <- c("biow", "cw", "bioval", "cval")
+sparse_mat <- sparseMatrix(i = iidx, j = jidx, x = (vidx*(weightm[w,1])), dims = c(rowss-1, colss))
+
+for (w in 1:nrow(weightm)) {
+#Get indices for country of interest
+#indices <- which(values(sr_ras) == m, arr.ind = TRUE)
+
+# Load the RDS file
+save_index <- readRDS(paste0(outfolderresults, "./save_index_global_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))
+#idx <- save_index[which(save_index > 0)]
+
+# Initialize an empty vector for storing the proportions
+# prop_all <- numeric(length(species.pu.list))
+# sum_occ <- numeric(length(species.pu.list))
+
+#Total sum of occurrences
+# for (i in 1:length(species.pu.list)) {
+#   # Count the number of elements in species.pu.list[[i]] that are also in newidx_set
+#   common_elements <- sum(species.pu.list[[i]] %in% idx)
+#   sum_occ[i] <- common_elements
+#   # Check if N is a multiple of 1,000,000
+#   if (i %% 1000 == 0) {
+#     print(i/length(species.pu.list) * 100)
+#   }
+# }
+
+values_greater_than_zero <- save_index[save_index > 0]
+spp_occ_vals_adjusted <- sparse_mat[, save_index]
+
+df.results[w, "biow"] <- weightm[w, 1]
+df.results[w, "cw"] <- weightm[w, 2]
+#df.results[w, "bioval"] <- mean(prop_all)
+df.results[w, "bioval"] <- sum(spp_occ_vals_adjusted)
+subset_cvals <- cvals[values_greater_than_zero]
+df.results[w, "cval"] <- sum(subset_cvals)
+
+}
+
+p = 0
+# Plot tradeoff curve
+png(file = paste0(outfoldervals, "./tradeoff_pen_", "global_", p, ".png"), width = 1000, height = 1000)
+plot(df.results$bioval, df.results$cval, type = "b", pch = 16, lty = "solid",
+     ylab = "Carbon sequestered",
+     xlab = "Mean proportion of species range conserved")
+dev.off()
+
+write.csv(df.results, file = paste0(outfoldervals, "./global.csv"), row.names = TRUE)
+
+
+```
+
+#MISC code
+# This is to run the analysis globally (one 30% global target) - create problem with maximum utility objective and solve
+```{r}
+# Planning units ID layer
+#sr_ras = raster("R:/RHODESFUT-Q3276/GBF-downscaling-analysis/Data/IIS_Rio_Data/CBD-corrected_countries-code.tif")
+sr_ras = raster("C:/Data/Modelling_Beyer/z_GBF/Data/CBD-corrected_countries-code.tif")
+base_ras = sr_ras - sr_ras
+# Combine the results into a data frame
+df.results <- data.frame(matrix(nrow = nweights, ncol = 4))
+colnames(df.results) <- c("biow", "cw", "bioval", "cval")
+
+w <- 1
+#for (w in 1:nrow(weightm)) {
+sparse_mat <- sparseMatrix(i = iidx, j = jidx, x = (vidx*(weightm[w,1]/dim(feat)[1])), dims = c(rowss-1, colss))
+carbon_mat <- sparseMatrix(i = rep(1, length(cvals)), j = c(1:length(cvals)), x = cvals*weightm[w,2], dims = c(1, colss))
+#Joint carbon values to species matrix
+rij <- rbind(sparse_mat, carbon_mat)
+#Restrict problem to just terrestrial units
+pu_val <- pu_val[terrestrial_index]
+rij <- rij[,terrestrial_index]
+
+p1 <-
+  problem(pu_val, feat, rij) %>%
+  add_max_utility_objective(target) %>%
+  add_binary_decisions() %>%
+  add_default_solver(gap = 0.005, verbose = FALSE, threads = num_cores) %>%
+  add_locked_in_constraints(locked_in) %>%
+  add_locked_out_constraints(locked_out) 
+
+#https://prioritizr.net/reference/add_neighbor_constraints.html
+#p2 <- p1 %>% add_neighbor_constraints(1, data = adjacency_matrix(base_ras, directions = 8))
+
+s1 <- solve(p1, force = TRUE)
+
+saveRDS(s1, file = paste0(outfolder, "./results_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))
+# Load an RDS file
+s1 <- readRDS(paste0(outfolder, "/results_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))
+
+# Plot the map
+png(file=paste0(outfoldermaps, "./results_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0", ".png"), width=1000, height=1000)
+base_ras[terrestrial_index] <- 1
+base_ras[terrestrial_index] <- s1
+# Display the raster with colors
+plot(base_ras, col = c("gray", "dark green"), legend = FALSE)
+# Add a legend
+legend("topright", legend = c("Not Selected", "Selected"), fill = c("gray", "dark green"))
+dev.off()
+
+#Save the raster
+writeRaster(base_ras, filename = paste0(outfolderrasts, "./results_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.tiff"), format = "GTiff", overwrite=TRUE)
+
+#Export values
+newidx <- terrestrial_index*s1
+# Initialize an empty vector for storing the proportions
+prop_all <- numeric(length(species.pu.list))
+sum_occ <- numeric(length(species.pu.list))
+# Create a set (unique values) from newidx for faster membership checks
+newidx_set <- unique(newidx)
+
+#Prop of species range conserved
+# Loop through the species.pu.list
+# for (i in 1:length(species.pu.list)) {
+#   # Count the number of elements in species.pu.list[[i]] that are also in newidx_set
+#   common_elements <- sum(species.pu.list[[i]] %in% newidx_set)
+#   # Calculate the proportion
+#   prop <- common_elements / length(species.pu.list[[i]])
+#   # Store the proportion in the prop_all vector
+#   prop_all[i] <- prop
+#   # Check if N is a multiple of 1,000,000
+#   if (i %% 1000 == 0) {
+#     print(i/length(species.pu.list) * 100)
+#   }
+# }
+
+#Total sum of occurances
+for (i in 1:length(species.pu.list)) {
+  # Count the number of elements in species.pu.list[[i]] that are also in newidx_set
+  common_elements <- sum(species.pu.list[[i]] %in% newidx_set)
+  sum_occ[i] <- common_elements
+  # Check if N is a multiple of 1,000,000
+  if (i %% 1000 == 0) {
+    print(i/length(species.pu.list) * 100)
+  }
+}
+
+df.results[w, "biow"] <- weightm[w, 1]
+df.results[w, "cw"] <- weightm[w, 2]
+#df.results[w, "bioval"] <- mean(prop_all)
+df.results[w, "bioval"] <- sum(sum_occ)
+df.results[w, "cval"] <- sum((cvals)[which(newidx > 0)])
+
+write.csv(df.results, file = paste0(outfoldervals, "./results_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.csv"), row.names = TRUE)
+
+rm(prop_all)
+rm(newidx)
+
+#}
+
+```
+
+```{r}
+# Because of computational challenges we had to export that tables separately, so now we have to tie them together
+# List all CSV files in the directory
+csv_files <- list.files(path = "C:/Data/Modelling_Beyer/z_GBF/SEALS_GBF_preprocessing/outputs_v2/vals_v2", pattern = "*.csv", full.names = TRUE)
+
+# Initialize an empty data frame to store the combined data
+combined_data <- data.frame()
+
+# Loop through each CSV file and combine the data
+for (file in csv_files) {
+  # Read the CSV file
+  data <- read.csv(file, header = TRUE, sep = ",", na.strings = "NA")
+  # Remove rows with NA values
+  data <- data[complete.cases(data), ]
+  # Append the data to the combined data frame
+  combined_data <- rbind(combined_data, data)
+}
+
+# Sort the combined data frame in ascending order based on the 'X' column
+combined_data <- combined_data[order(combined_data$biow), ]
+df.results <- combined_data[1:11,]
+p <- 0
+
+# Plot tradeoff curve
+png(file = paste0(outfoldervals, "./tradeoff_pen", p, ".png"), width = 1000, height = 1000)
+plot(df.results$bioval, df.results$cval, type = "b", pch = 16, lty = "solid",
+     ylab = "Mean proportion of species range conserved",
+     xlab = "Carbon sequestered")
+dev.off()
+
+write.csv(df.results, file = paste0(outfoldervals, "./results_ws_all_weights_p0.csv"), row.names = TRUE)
+
+```
+
+
+#Plotting benefits for 1 country
+```{r}
+
+# Combine the results into a data frame
+df.results <- data.frame(matrix(nrow = nweights, ncol = 4))
+colnames(df.results) <- c("biow", "cw", "bioval", "cval")
+
+m <- 3
+w <- 1
+for (w in 1:nrow(weightm)) {
+
+#Get indices for country of interest
+indices <- which(values(sr_ras) == m, arr.ind = TRUE)
+
+# Load the RDS file
+save_index <- readRDS(paste0(outfolderresults, "./", m, "_save_index_ws_", weightm[w,1], "_wc_", weightm[w,2], "_p0.rds"))
+
+# Initialize an empty vector for storing the proportions
+prop_all <- numeric(length(species.pu.list))
+sum_occ <- numeric(length(species.pu.list))
+
+#Total sum of occurrences
+for (i in 1:length(species.pu.list)) {
+  # Count the number of elements in species.pu.list[[i]] that are also in newidx_set
+  common_elements <- sum(species.pu.list[[i]] %in% save_index)
+  sum_occ[i] <- common_elements
+  # Check if N is a multiple of 1,000,000
+  if (i %% 1000 == 0) {
+    print(i/length(species.pu.list) * 100)
+  }
+}
+
+df.results[w, "biow"] <- weightm[w, 1]
+df.results[w, "cw"] <- weightm[w, 2]
+#df.results[w, "bioval"] <- mean(prop_all)
+df.results[w, "bioval"] <- sum(sum_occ)
+subset_cvals <- cvals[indices]
+df.results[w, "cval"] <- sum((subset_cvals)[which(save_index > 0)])
+}
+
+p = 0
+# Plot tradeoff curve
+png(file = paste0(outfoldervals, "./tradeoff_pen_", "_", m, "_", p, ".png"), width = 1000, height = 1000)
+plot(df.results$bioval, df.results$cval, type = "b", pch = 16, lty = "solid",
+     ylab = "Carbon sequestered",
+     xlab = "Mean proportion of species range conserved")
+dev.off()
+
+write.csv(df.results, file = paste0(outfoldervals, "./test.csv"), row.names = TRUE)
+
+
+```
+
+# Because of computational challenges we had to export that tables separately, so now we have to tie them together
+```{r}
+# List all CSV files in the directory
+csv_files <- list.files(path = "C:/Data/Modelling_Beyer/z_GBF/SEALS_GBF_preprocessing/outputs_v3/vals_v3", pattern = "^16.*\\.csv$", full.names = TRUE)
+
+# Initialize an empty data frame to store the combined data
+combined_data <- data.frame()
+
+# Loop through each CSV file and combine the data
+for (file in csv_files) {
+  # Read the CSV file
+  data <- read.csv(file, header = TRUE, sep = ",", na.strings = "NA")
+  # Remove rows with NA values
+  data <- data[complete.cases(data), ]
+  # Append the data to the combined data frame
+  combined_data <- rbind(combined_data, data)
+}
+
+# Sort the combined data frame in ascending order based on the 'X' column
+combined_data <- combined_data[order(combined_data$biow), ]
+df.results <- combined_data[1:11,]
+p <- 0
+
+df.results <- read.csv("C:/Data/Modelling_Beyer/z_GBF/SEALS_GBF_preprocessing/outputs_v3/vals_v3/16_results_ws_0_wc_1_p0.csv")
+# Plot tradeoff curve
+png(file = paste0(outfoldervals, "./tradeoff_pen", p, ".png"), width = 1000, height = 1000)
+plot(df.results$bioval, df.results$cval, type = "b", pch = 16, lty = "solid",
+     ylab = "Mean proportion of species range conserved",
+     xlab = "Carbon sequestered")
+dev.off()
+
+write.csv(df.results, file = paste0(outfoldervals, "./results_ws_all_weights_p0.csv"), row.names = TRUE)
+
+```
